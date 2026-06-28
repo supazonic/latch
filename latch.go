@@ -8,13 +8,16 @@ type Signal struct {
 }
 
 type Locker interface {
-	Acquire(ctx context.Context, key int64) (bool, error)
-	Release(ctx context.Context, key int64) error
+	AcquireLock(ctx context.Context, key int64) (bool, error)
+	ReleaseLock(ctx context.Context, key int64) error
 }
+
+// Handler is called when a notification arrives on the subscribed channel.
+type Handler func(ctx context.Context, payload string)
 
 type Signaler interface {
 	Notify(ctx context.Context, channel, payload string) error
-	Listen(ctx context.Context, channel string) (<-chan Signal, error)
+	Listen(ctx context.Context, handlers map[string]Handler) error
 }
 
 type Coordinator interface {

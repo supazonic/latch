@@ -11,8 +11,6 @@ import (
 	"github.com/supazonic/latch"
 )
 
-// DB wraps *sql.DB and implements latch.Coordinator.
-// The underlying *sql.DB must use the pgx driver (stdlib.OpenDB or sql.Open("pgx", ...)).
 type Latch struct {
 	db    *sql.DB
 	mu    sync.Mutex
@@ -28,9 +26,7 @@ func New(db *sql.DB) *Latch {
 	}
 }
 
-// Acquire tries to obtain a PostgreSQL session-level advisory lock for key.
-// It pins a dedicated connection for the duration so Release can unlock the same session.
-func (d *Latch) Acquire(ctx context.Context, key int64) (bool, error) {
+func (d *Latch) AcquireLock(ctx context.Context, key int64) (bool, error) {
 	conn, err := d.db.Conn(ctx)
 	if err != nil {
 		return false, fmt.Errorf("acquire connection: %w", err)
@@ -53,8 +49,7 @@ func (d *Latch) Acquire(ctx context.Context, key int64) (bool, error) {
 	return acquired, nil
 }
 
-// Release unlocks the advisory lock for key and returns its connection to the pool.
-func (d *Latch) Release(ctx context.Context, key int64) error {
+func (d *Latch) ReleaseLock(ctx context.Context, key int64) error {
 	d.mu.Lock()
 	conn, ok := d.conns[key]
 	if ok {
@@ -71,45 +66,41 @@ func (d *Latch) Release(ctx context.Context, key int64) error {
 	return err
 }
 
-// Notify sends a PostgreSQL NOTIFY on the given channel with payload.
 func (d *Latch) Notify(ctx context.Context, channel, payload string) error {
 	_, err := d.db.ExecContext(ctx, "SELECT pg_notify($1, $2)", channel, payload)
 	return err
 }
 
-// Listen issues LISTEN on channel and streams incoming notifications until ctx is cancelled.
-// The returned channel is closed when the context ends.
-func (d *Latch) Listen(ctx context.Context, channel string) (<-chan latch.Signal, error) {
-	sqlConn, err := d.db.Conn(ctx)
+// Listen subscribes to every channel in handlers on a single pinned connection.
+// Incoming notifications are dispatched to the matching handler until ctx is cancelled.
+func (d *Latch) Listen(ctx context.Context, handlers map[string]latch.Handler) error {
+	conn, err := d.db.Conn(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("acquire connection: %w", err)
+		return fmt.Errorf("acquire connection: %w", err)
 	}
 
-	if _, err := sqlConn.ExecContext(ctx, "LISTEN "+pgx.Identifier{channel}.Sanitize()); err != nil {
-		sqlConn.Close()
-		return nil, fmt.Errorf("listen %s: %w", channel, err)
+	for channel := range handlers {
+		if _, err := conn.ExecContext(ctx, "LISTEN "+pgx.Identifier{channel}.Sanitize()); err != nil {
+			conn.Close()
+			return fmt.Errorf("listen %s: %w", channel, err)
+		}
 	}
 
-	ch := make(chan latch.Signal, 16)
 	go func() {
-		defer sqlConn.Close()
-		defer close(ch)
-		// Raw keeps the connection pinned; the loop runs until ctx is done.
-		sqlConn.Raw(func(c any) error {
+		defer conn.Close()
+		conn.Raw(func(c any) error {
 			pgxConn := c.(*pgxstdlib.Conn).Conn()
 			for {
 				n, err := pgxConn.WaitForNotification(ctx)
 				if err != nil {
 					return nil
 				}
-				select {
-				case ch <- latch.Signal{Channel: n.Channel, Payload: n.Payload}:
-				case <-ctx.Done():
-					return nil
+				if h, ok := handlers[n.Channel]; ok {
+					h(ctx, n.Payload)
 				}
 			}
 		})
 	}()
 
-	return ch, nil
+	return nil
 }
