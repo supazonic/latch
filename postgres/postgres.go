@@ -13,16 +13,16 @@ import (
 
 // DB wraps *sql.DB and implements latch.Coordinator.
 // The underlying *sql.DB must use the pgx driver (stdlib.OpenDB or sql.Open("pgx", ...)).
-type DB struct {
+type Latch struct {
 	db    *sql.DB
 	mu    sync.Mutex
 	conns map[int64]*sql.Conn // pinned connections holding advisory locks
 }
 
-var _ latch.Coordinator = (*DB)(nil)
+var _ latch.Coordinator = (*Latch)(nil)
 
-func New(db *sql.DB) *DB {
-	return &DB{
+func New(db *sql.DB) *Latch {
+	return &Latch{
 		db:    db,
 		conns: make(map[int64]*sql.Conn),
 	}
@@ -30,7 +30,7 @@ func New(db *sql.DB) *DB {
 
 // Acquire tries to obtain a PostgreSQL session-level advisory lock for key.
 // It pins a dedicated connection for the duration so Release can unlock the same session.
-func (d *DB) Acquire(ctx context.Context, key int64) (bool, error) {
+func (d *Latch) Acquire(ctx context.Context, key int64) (bool, error) {
 	conn, err := d.db.Conn(ctx)
 	if err != nil {
 		return false, fmt.Errorf("acquire connection: %w", err)
@@ -54,7 +54,7 @@ func (d *DB) Acquire(ctx context.Context, key int64) (bool, error) {
 }
 
 // Release unlocks the advisory lock for key and returns its connection to the pool.
-func (d *DB) Release(ctx context.Context, key int64) error {
+func (d *Latch) Release(ctx context.Context, key int64) error {
 	d.mu.Lock()
 	conn, ok := d.conns[key]
 	if ok {
@@ -72,14 +72,14 @@ func (d *DB) Release(ctx context.Context, key int64) error {
 }
 
 // Notify sends a PostgreSQL NOTIFY on the given channel with payload.
-func (d *DB) Notify(ctx context.Context, channel, payload string) error {
+func (d *Latch) Notify(ctx context.Context, channel, payload string) error {
 	_, err := d.db.ExecContext(ctx, "SELECT pg_notify($1, $2)", channel, payload)
 	return err
 }
 
 // Listen issues LISTEN on channel and streams incoming notifications until ctx is cancelled.
 // The returned channel is closed when the context ends.
-func (d *DB) Listen(ctx context.Context, channel string) (<-chan latch.Signal, error) {
+func (d *Latch) Listen(ctx context.Context, channel string) (<-chan latch.Signal, error) {
 	sqlConn, err := d.db.Conn(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("acquire connection: %w", err)
