@@ -17,6 +17,12 @@ type Latch struct {
 	conns map[int64]*sql.Conn // pinned connections holding advisory locks
 }
 
+/*
+It's a compile-time interface check. It asserts that *Latch implements latch.Coordinator.
+(*Latch)(nil) creates a nil pointer of type *Latch and assigns it to a blank identifier _ of type latch.Coordinator.
+If *Latch is missing any method required by the interface, the code won't compile — you get an error pointing exactly to this line instead of somewhere at the call site where the type is actually used.
+Without this line, the mismatch would only surface when someone tries to use a *Latch as a latch.Coordinator, which could be in a completely different file or even a different package.
+*/
 var _ latch.Coordinator = (*Latch)(nil)
 
 func New(db *sql.DB) *Latch {
