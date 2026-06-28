@@ -15,9 +15,15 @@ type Locker interface {
 // Handler is called when a notification arrives on the subscribed channel.
 type Handler func(ctx context.Context, payload string)
 
+type Event string
+
+func (e Event) String() string {
+	return string(e)
+}
+
 type Signaler interface {
 	Notify(ctx context.Context, channel, payload string) error
-	Listen(ctx context.Context, handlers map[string]Handler) error
+	Listen(ctx context.Context, handlers map[Event]Handler) error
 }
 
 type Coordinator interface {

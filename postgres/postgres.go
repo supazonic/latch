@@ -73,16 +73,16 @@ func (d *Latch) Notify(ctx context.Context, channel, payload string) error {
 
 // Listen subscribes to every channel in handlers on a single pinned connection.
 // Incoming notifications are dispatched to the matching handler until ctx is cancelled.
-func (d *Latch) Listen(ctx context.Context, handlers map[string]latch.Handler) error {
+func (d *Latch) Listen(ctx context.Context, handlers map[latch.Event]latch.Handler) error {
 	conn, err := d.db.Conn(ctx)
 	if err != nil {
 		return fmt.Errorf("acquire connection: %w", err)
 	}
 
-	for channel := range handlers {
-		if _, err := conn.ExecContext(ctx, "LISTEN "+pgx.Identifier{channel}.Sanitize()); err != nil {
+	for event := range handlers {
+		if _, err := conn.ExecContext(ctx, "LISTEN "+pgx.Identifier{event.String()}.Sanitize()); err != nil {
 			conn.Close()
-			return fmt.Errorf("listen %s: %w", channel, err)
+			return fmt.Errorf("listen %s: %w", event.String(), err)
 		}
 	}
 
@@ -95,7 +95,7 @@ func (d *Latch) Listen(ctx context.Context, handlers map[string]latch.Handler) e
 				if err != nil {
 					return nil
 				}
-				if h, ok := handlers[n.Channel]; ok {
+				if h, ok := handlers[latch.Event(n.Channel)]; ok {
 					h(ctx, n.Payload)
 				}
 			}
