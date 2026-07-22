@@ -4,14 +4,15 @@ import (
 	"context"
 	"crypto/rand"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
-	"github.com/jackc/pgx/v5"
-	pgxstdlib "github.com/jackc/pgx/v5/stdlib"
+	"github.com/lib/pq"
 	"github.com/supazonic/latch"
 )
 
@@ -123,60 +124,98 @@ func (d *Latch) Notify(ctx context.Context, event latch.Event, payload string) (
 	return reply.Payload, nil
 }
 
+// pumpInterval is how often a subscription forces a round trip on its
+// pinned connection so lib/pq's read loop gets a chance to process any
+// buffered NotificationResponse message and invoke the notification
+// handler synchronously. lib/pq only surfaces notifications while it is
+// actively reading from the wire for some other command, there is no
+// background reader on a plain database/sql connection.
+const pumpInterval = 200 * time.Millisecond
+
 type subscription struct {
-	conn *sql.Conn
+	conn     *sql.Conn
+	notifyCh chan *pq.Notification
 }
 
-// Subscribe opens a single-event LISTEN on a dedicated connection. The
-// connection is guaranteed to be listening before Subscribe returns.
+// Subscribe opens a single-event LISTEN on a dedicated database/sql
+// connection and registers a lib/pq notification handler on the
+// underlying driver connection. The LISTEN is confirmed by the server
+// before Subscribe returns, so a Notify issued afterwards cannot be missed.
 func (d *Latch) Subscribe(ctx context.Context, event latch.Event) (latch.Subscription, error) {
 	conn, err := d.db.Conn(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("acquire connection: %w", err)
 	}
 
-	if _, err := conn.ExecContext(ctx, "LISTEN "+pgx.Identifier{event.String()}.Sanitize()); err != nil {
+	notifyCh := make(chan *pq.Notification, 1)
+	if err := conn.Raw(func(c any) error {
+		pq.SetNotificationHandler(c.(driver.Conn), func(n *pq.Notification) {
+			notifyCh <- n
+		})
+		return nil
+	}); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("set notification handler: %w", err)
+	}
+
+	if _, err := conn.ExecContext(ctx, "LISTEN "+pq.QuoteIdentifier(event.String())); err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("listen %s: %w", event.String(), err)
 	}
 
-	return &subscription{conn: conn}, nil
+	return &subscription{conn: conn, notifyCh: notifyCh}, nil
 }
 
 func (s *subscription) Wait(ctx context.Context) (string, error) {
-	var payload string
-	err := s.conn.Raw(func(c any) error {
-		pgxConn := c.(*pgxstdlib.Conn).Conn()
-		n, err := pgxConn.WaitForNotification(ctx)
-		if err != nil {
-			return err
+	ticker := time.NewTicker(pumpInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case n := <-s.notifyCh:
+			return n.Extra, nil
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-ticker.C:
+			// Forces a round trip so any pending NotificationResponse
+			// message gets read and dispatched to notifyCh above.
+			if _, err := s.conn.ExecContext(ctx, "SELECT 1"); err != nil {
+				return "", fmt.Errorf("pump connection: %w", err)
+			}
 		}
-		payload = n.Payload
-		return nil
-	})
-	if err != nil {
-		return "", err
 	}
-	return payload, nil
 }
 
 func (s *subscription) Close() error {
 	return s.conn.Close()
 }
 
-// Listen subscribes to every channel in handlers on a single pinned connection.
-// Incoming notifications are dispatched to the matching handler until ctx is
-// cancelled. If the notification is a round-trip request (i.e. it carries a
-// reply channel), the handler's result is implicitly sent back on that
-// channel once the handler returns — handlers never do this themselves.
+// Listen subscribes to every channel in handlers on a single pinned
+// connection and registers a lib/pq notification handler on the underlying
+// driver connection. Incoming notifications are dispatched to the matching
+// handler until ctx is cancelled. If the notification is a round-trip
+// request (i.e. it carries a reply event), the handler's result is
+// implicitly sent back on that event once the handler returns — handlers
+// never do this themselves.
 func (d *Latch) Listen(ctx context.Context, handlers map[latch.Event]latch.Handler) error {
 	conn, err := d.db.Conn(ctx)
 	if err != nil {
 		return fmt.Errorf("acquire connection: %w", err)
 	}
 
+	notifyCh := make(chan *pq.Notification, len(handlers))
+	if err := conn.Raw(func(c any) error {
+		pq.SetNotificationHandler(c.(driver.Conn), func(n *pq.Notification) {
+			notifyCh <- n
+		})
+		return nil
+	}); err != nil {
+		conn.Close()
+		return fmt.Errorf("set notification handler: %w", err)
+	}
+
 	for event := range handlers {
-		if _, err := conn.ExecContext(ctx, "LISTEN "+pgx.Identifier{event.String()}.Sanitize()); err != nil {
+		if _, err := conn.ExecContext(ctx, "LISTEN "+pq.QuoteIdentifier(event.String())); err != nil {
 			conn.Close()
 			return fmt.Errorf("listen %s: %w", event.String(), err)
 		}
@@ -184,20 +223,25 @@ func (d *Latch) Listen(ctx context.Context, handlers map[latch.Event]latch.Handl
 
 	go func() {
 		defer conn.Close()
-		conn.Raw(func(c any) error {
-			pgxConn := c.(*pgxstdlib.Conn).Conn()
-			for {
-				n, err := pgxConn.WaitForNotification(ctx)
-				if err != nil {
-					return nil
-				}
+		ticker := time.NewTicker(pumpInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case n := <-notifyCh:
 				h, ok := handlers[latch.Event(n.Channel)]
 				if !ok {
 					continue
 				}
-				go d.dispatch(ctx, h, n.Payload)
+				go d.dispatch(ctx, h, n.Extra)
+			case <-ticker.C:
+				if _, err := conn.ExecContext(ctx, "SELECT 1"); err != nil {
+					return
+				}
 			}
-		})
+		}
 	}()
 
 	return nil
